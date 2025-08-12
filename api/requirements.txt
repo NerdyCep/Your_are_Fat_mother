@@ -1,6 +1,4 @@
 fastapi
 uvicorn[standard]
-aiokafka
-asyncpg
-aioredis
+kafka-python
 pydantic

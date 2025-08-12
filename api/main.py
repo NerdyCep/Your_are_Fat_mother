@@ -1,97 +1,162 @@
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
-from uuid import UUID, uuid4
-from datetime import datetime
-import asyncio
-import aiokafka
-import asyncpg
-import aioredis
+# api/main.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uuid
+import time
+import json
+import sqlite3
+import os
+from kafka import KafkaProducer
+from typing import Optional
 
-app = FastAPI(title="High Risk Payment Aggregator API")
+DB_PATH = "/data/payments.db"
+os.makedirs("/data", exist_ok=True)
 
-# Подключения к сервисам (будут инициализированы в startup)
-kafka_producer = None
-pg_pool = None
-redis = None
 
-TOPIC = "payments"
+# ============================
+# Инициализация SQLite
+# ============================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        payment_id TEXT PRIMARY KEY,
+        merchant_id TEXT,
+        amount INTEGER,
+        currency TEXT,
+        status TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    );
+    """)
+    conn.commit()
+    conn.close()
 
+
+init_db()
+
+# ============================
+# Инициализация FastAPI
+# ============================
+app = FastAPI(title="Payment Aggregator API (MVP)")
+
+# ============================
+# Конфигурация Kafka Producer
+# ============================
+bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+producer = KafkaProducer(
+    bootstrap_servers=bootstrap,
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    api_version=(2, 0, 0)
+)
+
+
+# ============================
+# Модели запросов
+# ============================
 class PaymentRequest(BaseModel):
-    idempotency_key: UUID = Field(..., description="Уникальный ключ идемпотентности")
-    amount: float = Field(..., gt=0, description="Сумма платежа")
-    currency: str = Field(..., min_length=3, max_length=3, description="Валюта платежа")
-    user_id: str = Field(..., description="ID пользователя казино")
-    card_number: str = Field(..., min_length=12, max_length=19, description="Номер карты")
-    card_expiry: str = Field(..., regex=r"^(0[1-9]|1[0-2])\/?([0-9]{2})$", description="Срок действия карты MM/YY")
-    cvv: str = Field(..., min_length=3, max_length=4, description="CVV карты")
+    merchant_id: str
+    amount: int  # в центах
+    currency: str
 
-@app.on_event("startup")
-async def startup_event():
-    global kafka_producer, pg_pool, redis
-    kafka_producer = aiokafka.AIOKafkaProducer(
-        bootstrap_servers='localhost:9092',
-        client_id="payment_api"
-    )
-    await kafka_producer.start()
-    pg_pool = await asyncpg.create_pool(dsn="postgresql://user:password@localhost/payments")
-    redis = await aioredis.create_redis_pool("redis://localhost")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    global kafka_producer, pg_pool, redis
-    await kafka_producer.stop()
-    await pg_pool.close()
-    redis.close()
-    await redis.wait_closed()
+class CallbackRequest(BaseModel):
+    payment_id: str
+    status: str
 
-@app.post("/payments", status_code=202)
-async def create_payment(payment: PaymentRequest, request: Request):
-    # Проверка идемпотентности в Postgres
-    async with pg_pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM payments WHERE idempotency_key=$1", str(payment.idempotency_key))
-        if exists:
-            raise HTTPException(status_code=409, detail="Платеж с таким idempotency_key уже существует")
 
-        # Проверка rate limiting по user_id в Redis (например, не больше 10 запросов в минуту)
-        key = f"rate_limit:{payment.user_id}"
-        count = await redis.incr(key)
-        if count == 1:
-            await redis.expire(key, 60)
-        if count > 10:
-            raise HTTPException(status_code=429, detail="Превышен лимит запросов")
+# ============================
+# Создание платежа
+# ============================
+@app.post("/v1/payments")
+async def create_payment(req: PaymentRequest):
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be > 0")
 
-        # Добавляем платеж в базу в статусе "pending"
-        await conn.execute("""
-            INSERT INTO payments (idempotency_key, amount, currency, user_id, card_number, card_expiry, cvv, status, created_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',NOW())
-        """,
-            str(payment.idempotency_key),
-            payment.amount,
-            payment.currency,
-            payment.user_id,
-            payment.card_number,
-            payment.card_expiry,
-            payment.cvv
-        )
+    payment_id = str(uuid.uuid4())
+    now = int(time.time())
+
+    event = {
+        "event_type": "payment.requested",
+        "payment_id": payment_id,
+        "merchant_id": req.merchant_id,
+        "amount": req.amount,
+        "currency": req.currency,
+        "created_at": now
+    }
+
+    # Сохраняем в SQLite
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO payments(payment_id, merchant_id, amount, currency, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (payment_id, req.merchant_id, req.amount, req.currency, "processing", now, now))
+    conn.commit()
+    conn.close()
 
     # Отправляем в Kafka
-    await kafka_producer.send_and_wait(TOPIC, payment.json().encode("utf-8"))
+    producer.send("payments", event)
+    producer.flush()
 
-    return {"status": "accepted", "idempotency_key": payment.idempotency_key}
+    return {"payment_id": payment_id, "status": "processing"}
 
-@app.get("/payments/{idempotency_key}")
-async def get_payment_status(idempotency_key: UUID):
-    async with pg_pool.acquire() as conn:
-        record = await conn.fetchrow("SELECT * FROM payments WHERE idempotency_key=$1", str(idempotency_key))
-        if not record:
-            raise HTTPException(status_code=404, detail="Платеж не найден")
 
-        return {
-            "idempotency_key": record["idempotency_key"],
-            "amount": record["amount"],
-            "currency": record["currency"],
-            "user_id": record["user_id"],
-            "status": record["status"],
-            "created_at": record["created_at"].isoformat(),
-            "updated_at": record["updated_at"].isoformat() if record["updated_at"] else None
-        }
+# ============================
+# Callback от коннектора
+# ============================
+@app.post("/v1/payments/callback")
+async def payment_callback(req: CallbackRequest):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    now = int(time.time())
+
+    cur.execute(
+        "UPDATE payments SET status=?, updated_at=? WHERE payment_id=?",
+        (req.status, now, req.payment_id)
+    )
+
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="payment not found")
+
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+# ============================
+# Получить платеж
+# ============================
+@app.get("/v1/payments/{payment_id}")
+async def get_payment(payment_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT payment_id, merchant_id, amount, currency, status, created_at, updated_at
+        FROM payments WHERE payment_id=?
+    """, (payment_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="payment not found")
+
+    return {
+        "payment_id": row[0],
+        "merchant_id": row[1],
+        "amount": row[2],
+        "currency": row[3],
+        "status": row[4],
+        "created_at": row[5],
+        "updated_at": row[6]
+    }
+
+
+# ============================
+# Healthcheck
+# ============================
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

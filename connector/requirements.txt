@@ -1,3 +1,2 @@
-aiokafka
-asyncpg
-aiohttp
+kafka-python
+requests

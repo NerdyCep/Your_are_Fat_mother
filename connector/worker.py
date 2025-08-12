@@ -1,63 +1,44 @@
-import asyncio
-import aiokafka
-import asyncpg
-import aiohttp
-import json
-import logging
+# connector/worker.py
+import json, time, requests
+from kafka import KafkaConsumer, KafkaProducer
+import os
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("connector_worker")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "redpanda:9092")
+API_CALLBACK_URL = os.getenv("API_CALLBACK", "http://api:8000/v1/payments/callback")
+ACQUIRER_URL = os.getenv("ACQUIRER_URL", "http://acquirer:5000/process")
 
-KAFKA_TOPIC = "payments"
-KAFKA_BOOTSTRAP = "localhost:9092"
-POSTGRES_DSN = "postgresql://user:password@localhost/payments"
-ACQUIRER_URL = "http://localhost:8001/process_payment"  # симулятор эквайера
+consumer = KafkaConsumer(
+    "payments",
+    bootstrap_servers=KAFKA_BOOTSTRAP,
+    value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+    auto_offset_reset='earliest',
+    enable_auto_commit=True,
+    group_id='connector-group'
+)
 
-async def process_payment(message, pg_pool, session):
-    payment = json.loads(message.value.decode())
-    idempotency_key = payment["idempotency_key"]
+print("Connector started, awaiting messages...")
 
-    async with pg_pool.acquire() as conn:
-        record = await conn.fetchrow("SELECT status FROM payments WHERE idempotency_key=$1", idempotency_key)
-        if not record:
-            logger.warning(f"Платеж не найден: {idempotency_key}")
-            return
-        if record["status"] != "pending":
-            logger.info(f"Платеж уже обработан: {idempotency_key} статус {record['status']}")
-            return
+for msg in consumer:
+    data = msg.value
+    payment_id = data.get("payment_id")
+    print(f"[connector] processing payment {payment_id}")
+    try:
+        # send to acquirer
+        resp = requests.post(ACQUIRER_URL, json=data, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        status = result.get("status", "failed")
+    except Exception as e:
+        print(f"[connector] error contacting acquirer: {e}")
+        status = "error"
 
-        # Отправляем платеж в эквайер
-        try:
-            async with session.post(ACQUIRER_URL, json=payment, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    status = data.get("status", "failed")
-                else:
-                    status = "failed"
-        except Exception as e:
-            logger.error(f"Ошибка при отправке в эквайер: {e}")
-            status = "failed"
-
-        # Обновляем статус платежа
-        await conn.execute("UPDATE payments SET status=$1, updated_at=NOW() WHERE idempotency_key=$2", status, idempotency_key)
-        logger.info(f"Платеж {idempotency_key} обновлён статусом {status}")
-
-async def main():
-    pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN)
-    consumer = aiokafka.AIOKafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id="payment_connector_group"
-    )
-    await consumer.start()
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async for message in consumer:
-                await process_payment(message, pg_pool, session)
-        finally:
-            await consumer.stop()
-            await pg_pool.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # post back to API callback
+    try:
+        cb = {"payment_id": payment_id, "status": status}
+        r2 = requests.post(API_CALLBACK_URL, json=cb, timeout=10)
+        if r2.status_code == 200:
+            print(f"[connector] updated API with status={status} for {payment_id}")
+        else:
+            print(f"[connector] API callback returned {r2.status_code}, body={r2.text}")
+    except Exception as e:
+        print(f"[connector] failed callback: {e}")
