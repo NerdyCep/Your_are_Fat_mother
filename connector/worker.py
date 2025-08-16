@@ -1,10 +1,7 @@
-# connector/worker.py
-import json, time, requests
-from kafka import KafkaConsumer, KafkaProducer
-import os
+import json, time, requests, os
+from kafka import KafkaConsumer
 
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "redpanda:9092")
-API_CALLBACK_URL = os.getenv("API_CALLBACK", "http://api:8000/v1/payments/callback")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 ACQUIRER_URL = os.getenv("ACQUIRER_URL", "http://acquirer:5000/process")
 
 consumer = KafkaConsumer(
@@ -20,25 +17,19 @@ print("Connector started, awaiting messages...")
 
 for msg in consumer:
     data = msg.value
-    payment_id = data.get("payment_id")
-    print(f"[connector] processing payment {payment_id}")
+    pid = data.get("payment_id")
+    print(f"[connector] processing payment {pid}")
+    status = "error"
     try:
-        # send to acquirer
         resp = requests.post(ACQUIRER_URL, json=data, timeout=15)
         resp.raise_for_status()
-        result = resp.json()
-        status = result.get("status", "failed")
+        status = resp.json().get("status", "failed")
     except Exception as e:
         print(f"[connector] error contacting acquirer: {e}")
-        status = "error"
 
-    # post back to API callback
     try:
-        cb = {"payment_id": payment_id, "status": status}
-        r2 = requests.post(API_CALLBACK_URL, json=cb, timeout=10)
-        if r2.status_code == 200:
-            print(f"[connector] updated API with status={status} for {payment_id}")
-        else:
-            print(f"[connector] API callback returned {r2.status_code}, body={r2.text}")
+        cb = {"payment_id": pid, "status": status}
+        r2 = requests.post("http://api:8000/v1/payments/callback", json=cb, timeout=10)
+        print(f"[connector] callback -> {r2.status_code}, status={status}")
     except Exception as e:
-        print(f"[connector] failed callback: {e}")
+        print(f"[connector] callback failed: {e}")

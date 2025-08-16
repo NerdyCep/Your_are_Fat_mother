@@ -1,162 +1,219 @@
-# api/main.py
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uuid
-import time
-import json
-import sqlite3
 import os
-from kafka import KafkaProducer
+import time
+import uuid
+import json
 from typing import Optional
 
-DB_PATH = "/data/payments.db"
-os.makedirs("/data", exist_ok=True)
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, Request, HTTPException, Header
+from pydantic import BaseModel
+from kafka import KafkaProducer
 
+# -------------------------------------------------------------------
+# Конфигурация
+# -------------------------------------------------------------------
 
-# ============================
-# Инициализация SQLite
-# ============================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        payment_id TEXT PRIMARY KEY,
-        merchant_id TEXT,
-        amount INTEGER,
-        currency TEXT,
-        status TEXT,
-        created_at INTEGER,
-        updated_at INTEGER
-    );
-    """)
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-# ============================
-# Инициализация FastAPI
-# ============================
-app = FastAPI(title="Payment Aggregator API (MVP)")
-
-# ============================
-# Конфигурация Kafka Producer
-# ============================
-bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-producer = KafkaProducer(
-    bootstrap_servers=bootstrap,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    api_version=(2, 0, 0)
+DB_DSN = os.getenv(
+    "DB_DSN",
+    "dbname=payments user=postgres host=postgres password=postgres"
 )
 
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 
-# ============================
-# Модели запросов
-# ============================
+# Kafka producer
+producer = KafkaProducer(
+    bootstrap_servers=[KAFKA_BOOTSTRAP],
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+)
+
+app = FastAPI()
+
+# -------------------------------------------------------------------
+# Модели
+# -------------------------------------------------------------------
+
 class PaymentRequest(BaseModel):
-    merchant_id: str
-    amount: int  # в центах
+    amount: int
     currency: str
+    order_id: Optional[str] = None
 
+# -------------------------------------------------------------------
+# DB helpers
+# -------------------------------------------------------------------
 
-class CallbackRequest(BaseModel):
-    payment_id: str
-    status: str
-
-
-# ============================
-# Создание платежа
-# ============================
-@app.post("/v1/payments")
-async def create_payment(req: PaymentRequest):
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be > 0")
-
-    payment_id = str(uuid.uuid4())
-    now = int(time.time())
-
-    event = {
-        "event_type": "payment.requested",
-        "payment_id": payment_id,
-        "merchant_id": req.merchant_id,
-        "amount": req.amount,
-        "currency": req.currency,
-        "created_at": now
-    }
-
-    # Сохраняем в SQLite
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO payments(payment_id, merchant_id, amount, currency, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (payment_id, req.merchant_id, req.amount, req.currency, "processing", now, now))
-    conn.commit()
-    conn.close()
-
-    # Отправляем в Kafka
-    producer.send("payments", event)
-    producer.flush()
-
-    return {"payment_id": payment_id, "status": "processing"}
-
-
-# ============================
-# Callback от коннектора
-# ============================
-@app.post("/v1/payments/callback")
-async def payment_callback(req: CallbackRequest):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    now = int(time.time())
-
-    cur.execute(
-        "UPDATE payments SET status=?, updated_at=? WHERE payment_id=?",
-        (req.status, now, req.payment_id)
-    )
-
-    if cur.rowcount == 0:
+def get_merchant_by_api_key(api_key: str):
+    """Возвращает мерчанта по API-ключу"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id FROM merchants WHERE api_key = %s LIMIT 1", (api_key,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="payment not found")
-
-    conn.commit()
-    conn.close()
-    return {"ok": True}
 
 
-# ============================
-# Получить платеж
-# ============================
-@app.get("/v1/payments/{payment_id}")
-async def get_payment(payment_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT payment_id, merchant_id, amount, currency, status, created_at, updated_at
-        FROM payments WHERE payment_id=?
-    """, (payment_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="payment not found")
-
-    return {
-        "payment_id": row[0],
-        "merchant_id": row[1],
-        "amount": row[2],
-        "currency": row[3],
-        "status": row[4],
-        "created_at": row[5],
-        "updated_at": row[6]
-    }
+def get_payment_by_idempotency(merchant_id: str, idempotency_key: str):
+    """Вернёт платеж если уже существует для пары (merchant_id, idempotency_key)"""
+    if not idempotency_key:
+        return None
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT payment_id, status
+                FROM payments
+                WHERE merchant_id = %s AND idempotency_key = %s
+                LIMIT 1
+                """,
+                (merchant_id, idempotency_key),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
 
 
-# ============================
-# Healthcheck
-# ============================
+def insert_payment(p: dict):
+    """Вставка платежа. При конфликте по уникальному индексу бросит исключение"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO payments
+                       (payment_id, merchant_id, amount, currency, status,
+                        order_id, idempotency_key, created_at, updated_at)
+                    VALUES
+                       (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        p["payment_id"],
+                        p["merchant_id"],
+                        p["amount"],
+                        p["currency"],
+                        p["status"],
+                        p.get("order_id"),
+                        p.get("idempotency_key"),
+                        p["created_at"],
+                        p["updated_at"],
+                    ),
+                )
+    finally:
+        conn.close()
+
+
+def get_payment(payment_id: str):
+    """Вернёт платёж по ID"""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT payment_id, merchant_id, amount, currency, status,
+                       order_id, idempotency_key, created_at, updated_at
+                FROM payments
+                WHERE payment_id = %s
+                """,
+                (payment_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------------
+# API
+# -------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/v1/payments")
+async def create_payment(
+    req: PaymentRequest,
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    # 1) валидация
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be > 0")
+    if not req.currency:
+        raise HTTPException(status_code=400, detail="Currency required")
+
+    # 2) авторизация мерчанта
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key")
+
+    m = get_merchant_by_api_key(api_key)
+    if not m:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    merchant_id = m["id"]
+
+    # 3) быстрый путь идемпотентности
+    if idempotency_key:
+        existing = get_payment_by_idempotency(merchant_id, idempotency_key)
+        if existing:
+            return {
+                "payment_id": existing["payment_id"],
+                "status": existing["status"],
+            }
+
+    # 4) создаём новый платёж
+    pid = str(uuid.uuid4())
+    now = int(time.time())
+    payment_row = {
+        "payment_id": pid,
+        "merchant_id": merchant_id,
+        "amount": req.amount,
+        "currency": req.currency,
+        "status": "processing",
+        "order_id": req.order_id,
+        "idempotency_key": idempotency_key,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    created_new = True
+    try:
+        insert_payment(payment_row)
+    except Exception:
+        if idempotency_key:
+            existing = get_payment_by_idempotency(merchant_id, idempotency_key)
+            if existing:
+                created_new = False
+                pid = existing["payment_id"]
+            else:
+                raise
+        else:
+            raise
+
+    # 5) публикуем событие только если платёж новый
+    if created_new:
+        event = {
+            "event_type": "payment.requested",
+            "payment_id": pid,
+            "merchant_id": merchant_id,
+            "amount": req.amount,
+            "currency": req.currency,
+            "created_at": now,
+        }
+        producer.send("payments", event)
+        producer.flush()
+
+    return {"payment_id": pid, "status": "processing"}
+
+
+@app.get("/v1/payments/{payment_id}")
+async def get_payment_api(payment_id: str):
+    p = get_payment(payment_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return p

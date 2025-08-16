@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   kafka:
     image: bitnami/kafka:latest
@@ -18,10 +16,22 @@ services:
     volumes:
       - kafka_data:/bitnami/kafka
     healthcheck:
-      test: ["CMD", "bash", "-lc", "cub kafka-ready -b localhost:9092 1 20 || exit 1"]
+      test: ["CMD-SHELL", "bash -lc 'echo > /dev/tcp/localhost/9092'"]
       interval: 10s
-      timeout: 10s
+      timeout: 3s
       retries: 6
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
 
   api:
     build:
@@ -29,10 +39,34 @@ services:
     container_name: api
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - DB_DSN=postgresql://postgres:postgres@postgres:5432/payments
+      - ADMIN_TOKEN=dev-admin
     ports:
       - "8000:8000"
     depends_on:
       - kafka
+      - postgres
+    volumes:
+      - ./wait-for-it.sh:/wait-for-it.sh
+    command:
+      - sh
+      - -c
+      - |
+        python - <<'PY'
+        import socket, time
+        def wait(host, port, name):
+            while True:
+                s=socket.socket(); s.settimeout(2)
+                try:
+                    s.connect((host, port)); s.close()
+                    print(f"[wait] {name} ready at {host}:{port}"); return
+                except Exception as e:
+                    print(f"[wait] {name} not ready: {e}"); time.sleep(1)
+        wait("postgres", 5432, "postgres")
+        wait("kafka", 9092, "kafka")
+        PY
+        uvicorn main:app --host 0.0.0.0 --port 8000
+
 
   connector:
     build:
@@ -50,8 +84,45 @@ services:
     build:
       context: ../acquirer_simulator
     container_name: acquirer
+    # порт наружу НЕ публикуем (внутренняя сеть Docker)
+    # ports:
+    #   - "5000:5000"
+
+  webhook_dispatcher:
+    build:
+      context: ../webhook_dispatcher
+    container_name: webhook_dispatcher
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/payments
+      - MERCHANT_HMAC_SECRET=dev_secret
+    depends_on:
+      - postgres
+      - kafka
+    command:
+      - sh
+      - -c
+      - |
+        python - <<'PY'
+        import socket, time
+        def wait(host, port, name):
+            while True:
+                s=socket.socket(); s.settimeout(2)
+                try:
+                    s.connect((host, port)); s.close()
+                    print(f"[wait] {name} ready at {host}:{port}"); return
+                except Exception as e:
+                    print(f"[wait] {name} not ready: {e}"); time.sleep(1)
+        wait("postgres", 5432, "postgres")
+        wait("kafka", 9092, "kafka")
+        PY
+        python dispatcher.py
+
+  merchant_webhook:
+    build:
+      context: ../merchant_webhook
+    container_name: merchant_webhook
     ports:
-      - "5000:5000"
+      - "8080:8080"
 
 volumes:
   kafka_data:
