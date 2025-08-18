@@ -67,7 +67,6 @@ services:
         PY
         uvicorn main:app --host 0.0.0.0 --port 8000
 
-
   connector:
     build:
       context: ../connector
@@ -84,9 +83,7 @@ services:
     build:
       context: ../acquirer_simulator
     container_name: acquirer
-    # порт наружу НЕ публикуем (внутренняя сеть Docker)
-    # ports:
-    #   - "5000:5000"
+    # порт наружу НЕ публикуем
 
   webhook_dispatcher:
     build:
@@ -123,6 +120,26 @@ services:
     container_name: merchant_webhook
     ports:
       - "8080:8080"
+
+  admin:
+    build:
+      context: ../admin
+      dockerfile: Dockerfile
+    container_name: admin
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/payments
+      ADMIN_USER: admin
+      ADMIN_PASS: supersecret
+    depends_on:
+      - postgres
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8001/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
 
 volumes:
   kafka_data:
