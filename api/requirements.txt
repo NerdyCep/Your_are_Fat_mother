@@ -3,3 +3,4 @@ uvicorn[standard]
 kafka-python
 pydantic
 psycopg2-binary
+SQLAlchemy==2.0.32

@@ -10,6 +10,10 @@ from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel
 from kafka import KafkaProducer
 
+from admin_api import router as admin_router  # <— импортируем
+app = FastAPI()
+app.include_router(admin_router)
+
 # -------------------------------------------------------------------
 # Конфигурация
 # -------------------------------------------------------------------
@@ -27,7 +31,6 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
-app = FastAPI()
 
 # -------------------------------------------------------------------
 # Модели
@@ -217,3 +220,5 @@ async def get_payment_api(payment_id: str):
     if not p:
         raise HTTPException(status_code=404, detail="Payment not found")
     return p
+
+

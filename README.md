@@ -94,4 +94,62 @@ curl: (56) Recv failure: Connection reset by peer на /health → Postgres не
 
 ---
 
-Хочешь, я ещё сделаю для тебя минимальный SQL-файл `infra/postgres-init.sql`, чтобы он 
+repo/
+├─ api/                    # FastAPI (включая /admin-api/*)
+├─ acquirer_simulator/
+├─ connector/
+├─ merchant_webhook/
+├─ webhook_dispatcher/
+├─ admin/                  # sqladmin-панель (http://localhost:8001/admin)
+│  ├─ app.py, models.py, views.py, auth.py, Dockerfile, requirements.txt
+├─ dashboard/              # веб-панель (http://localhost:8081)
+│  ├─ public/index.html
+│  ├─ src/
+│  │  ├─ api.ts
+│  │  ├─ main.tsx
+│  │  └─ types/
+│  │     ├─ react/index.d.ts
+│  │     └─ react-dom/client/index.d.ts
+│  ├─ tsconfig.json
+│  ├─ package.json
+│  ├─ Dockerfile
+│  └─ nginx.conf
+└─ infra/
+   ├─ docker-compose.yml   # содержит сервисы: postgres, kafka, api, connector, acquirer,
+   │                       # webhook_dispatcher, merchant_webhook, admin, dashboard
+   └─ postgres-data/       # данные БД (dev)
+
+
+           ┌────────────────────┐
+           │  Dashboard (8081)  │  — SPA, токен dev-admin
+           └───────┬────────────┘
+                   │ /api/*
+                   ▼
+┌───────────────────────────────────────────────────────────────┐
+│                          API (8000)                           │
+│  - /v1/payments  (X-API-Key, Idempotency-Key)                 │
+│  - /admin-api/*  (Bearer dev-admin)                           │
+│  Идемпотентность: UNIQUE (merchant_id, idempotency_key)       │
+│  При создании платежа публикует событие в Kafka (topic: payments)*
+└───────────┬───────────────────────────────┬───────────────────┘
+            │                               │
+            │                               │
+            ▼                               ▼
+   ┌────────────────┐               ┌──────────────────────┐
+   │   Postgres     │               │   Kafka (payments)   │
+   │ merchants,     │               └──────────┬───────────┘
+   │ payments,      │                          │
+   │ webhook_outbox │                          │
+   └───────┬────────┘                          │
+           │                                   
+           │(скан)     ┌──────────────────────┐ │ consume
+           └──────────►│ Webhook Dispatcher   │◄┘ (Connector/Acquirer — как в проекте)
+                       │ читает payments →     │
+                       │ пишет в webhook_outbox│
+                       │ шлёт POST на merchant │
+                       └──────────┬────────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────────┐
+                         │ Merchant Webhook     │ (8080)
+                         └──────────────────────┘
