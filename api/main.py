@@ -11,10 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kafka import KafkaProducer
 
-from admin_api import router as admin_router  # <— импортируем
-app = FastAPI(title="Payments Admin API")
-app.include_router(admin_router)
+# ВАЖНО: пакетный импорт (при запуске uvicorn api.main:app)
+# Убедись, что файл api/__init__.py существует (можно пустой)
+from .admin_api import router as admin_router
 
+app = FastAPI(title="Payments Admin API")
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,11 +26,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Подключаем административные роуты один раз
 app.include_router(admin_router)
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 # -------------------------------------------------------------------
 # Конфигурация
@@ -35,6 +43,7 @@ def healthz():
 
 DB_DSN = os.getenv(
     "DB_DSN",
+    # Формат для psycopg2 в стиле libpq — ок.
     "dbname=payments user=postgres host=postgres password=postgres"
 )
 
@@ -46,6 +55,36 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
+# -------------------------------------------------------------------
+# Страховка: создать refunds на старте приложения
+# -------------------------------------------------------------------
+
+REFUNDS_DDL = """
+CREATE TABLE IF NOT EXISTS refunds (
+  refund_id   uuid PRIMARY KEY,
+  payment_id  uuid NOT NULL REFERENCES payments(payment_id) ON DELETE CASCADE,
+  amount      integer NOT NULL CHECK (amount > 0),
+  currency    varchar(8) NOT NULL,
+  status      varchar(16) NOT NULL CHECK (status IN ('requested','succeeded','failed')),
+  reason      varchar(200),
+  created_at  integer NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_refunds_payment ON refunds(payment_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_created ON refunds(created_at);
+CREATE INDEX IF NOT EXISTS idx_refunds_status  ON refunds(status);
+"""
+
+@app.on_event("startup")
+def ensure_refunds_table() -> None:
+    """Гарантированно создаём таблицу refunds, даже если файловые миграции не применились."""
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(REFUNDS_DDL)
+    finally:
+        conn.close()
 
 # -------------------------------------------------------------------
 # Модели
@@ -144,13 +183,8 @@ def get_payment(payment_id: str):
         conn.close()
 
 # -------------------------------------------------------------------
-# API
+# Публичное API
 # -------------------------------------------------------------------
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
 
 @app.post("/v1/payments")
 async def create_payment(
@@ -235,5 +269,3 @@ async def get_payment_api(payment_id: str):
     if not p:
         raise HTTPException(status_code=404, detail="Payment not found")
     return p
-
-

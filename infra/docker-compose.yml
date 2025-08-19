@@ -21,6 +21,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 6
+    restart: unless-stopped
 
   postgres:
     image: postgres:15
@@ -33,40 +34,34 @@ services:
       - "5432:5432"
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payments -h localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   api:
     build:
-      context: ../api
-    container_name: api
+      context: ..              
+      dockerfile: api/Dockerfile
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - DB_DSN=postgresql://postgres:postgres@postgres:5432/payments
-      - ADMIN_TOKEN=dev-admin
-    ports:
-      - "8000:8000"
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: payments
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      ADMIN_TOKEN: dev-admin
+      KAFKA_BOOTSTRAP: kafka:9092
     depends_on:
-      - kafka
-      - postgres
-    volumes:
-      - ./wait-for-it.sh:/wait-for-it.sh
-    command:
-      - sh
-      - -c
-      - |
-        python - <<'PY'
-        import socket, time
-        def wait(host, port, name):
-            while True:
-                s=socket.socket(); s.settimeout(2)
-                try:
-                    s.connect((host, port)); s.close()
-                    print(f"[wait] {name} ready at {host}:{port}"); return
-                except Exception as e:
-                    print(f"[wait] {name} not ready: {e}"); time.sleep(1)
-        wait("postgres", 5432, "postgres")
-        wait("kafka", 9092, "kafka")
-        PY
-        uvicorn main:app --host 0.0.0.0 --port 8000
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8000"   # API доступен с хоста по http://localhost:8080
+    restart: unless-stopped
 
   connector:
     build:
@@ -76,15 +71,19 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - ACQUIRER_URL=http://acquirer:5000/process
     depends_on:
-      - kafka
-      - api
-      - acquirer
+      kafka:
+        condition: service_healthy
+      api:
+        condition: service_started
+      acquirer:
+        condition: service_started
+    restart: unless-stopped
 
   acquirer:
     build:
       context: ../acquirer_simulator
     container_name: acquirer
-    # порт наружу НЕ публикуем
+    restart: unless-stopped
 
   webhook_dispatcher:
     build:
@@ -94,8 +93,10 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/payments
       - MERCHANT_HMAC_SECRET=dev_secret
     depends_on:
-      - postgres
-      - kafka
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
     command:
       - sh
       - -c
@@ -114,13 +115,15 @@ services:
         wait("kafka", 9092, "kafka")
         PY
         python dispatcher.py
+    restart: unless-stopped
 
   merchant_webhook:
     build:
       context: ../merchant_webhook
     container_name: merchant_webhook
     ports:
-      - "8080:8080"
+      - "8082:8080"   # чтобы не конфликтовать с api:8080
+    restart: unless-stopped
 
   admin:
     build:
@@ -132,7 +135,8 @@ services:
       ADMIN_USER: admin
       ADMIN_PASS: supersecret
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
       - "8001:8001"
     healthcheck:
@@ -140,6 +144,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   dashboard:
     build:
@@ -147,10 +152,11 @@ services:
       dockerfile: Dockerfile
     container_name: dashboard
     depends_on:
-      - api
+      api:
+        condition: service_started
     ports:
       - "8081:80"
-
+    restart: unless-stopped
 
 volumes:
   kafka_data:

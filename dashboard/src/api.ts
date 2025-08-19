@@ -1,5 +1,6 @@
 // dashboard/src/api.ts
 export type PaymentStatus = "new" | "processing" | "approved" | "declined" | "failed";
+export type RefundStatus  = "requested" | "succeeded" | "failed";
 
 export type Payment = {
   payment_id: string;
@@ -19,6 +20,16 @@ export type Merchant = {
   api_key?: string | null;
 };
 
+export type Refund = {
+  refund_id: string;
+  payment_id: string;
+  amount: number;
+  currency: string;
+  status: RefundStatus;
+  reason?: string | null;
+  created_at: number;
+};
+
 export type Stats = {
   counts_by_status: Record<string, number>;
   merchants_total: number;
@@ -27,6 +38,13 @@ export type Stats = {
 
 export type PaymentsResponse = {
   items: Payment[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type RefundsResponse = {
+  items: Refund[];
   total: number;
   limit: number;
   offset: number;
@@ -99,16 +117,43 @@ export function listPayments(params: {
   const qs = toQuery(params);
   return http<PaymentsResponse>(`/payments?${qs}`);
 }
-
 export function getPayment(id: string): Promise<Payment> {
   return http<Payment>(`/payments/${id}`);
 }
-
 export function updatePaymentStatus(id: string, status: PaymentStatus): Promise<Payment> {
   return http<Payment>(`/payments/${id}`, { method:"PATCH", body: JSON.stringify({ status }) });
 }
 export function resendWebhook(id: string): Promise<{status: string}> {
   return http<{status:string}>(`/payments/${id}/resend-webhook`, { method:"POST" });
+}
+
+// Refunds
+export function listRefunds(params: {
+  payment_id?: string;
+  status?: RefundStatus;
+  created_from?: number;
+  created_to?: number;
+  limit?: number;
+  offset?: number;
+  order?: "asc"|"desc";
+} = {}): Promise<RefundsResponse> {
+  const qs = toQuery(params);
+  return http<RefundsResponse>(`/refunds?${qs}`);
+}
+export function listRefundsByPayment(payment_id: string, limit=100): Promise<RefundsResponse> {
+  return http<RefundsResponse>(`/payments/${payment_id}/refunds?limit=${limit}`);
+}
+export function createRefund(payment_id: string, amount: number, reason?: string, result?: RefundStatus): Promise<Refund> {
+  return http<Refund>(`/payments/${payment_id}/refunds`, {
+    method: "POST",
+    body: JSON.stringify({ amount, reason, result })
+  });
+}
+export function simulateRefund(payment_id: string, amount: number, reason?: string, success = true): Promise<Refund> {
+  return http<Refund>(`/payments/${payment_id}/simulate-refund`, {
+    method: "POST",
+    body: JSON.stringify({ amount, reason, success })
+  });
 }
 
 // Stats

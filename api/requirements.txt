@@ -1,8 +1,15 @@
-fastapi
-uvicorn[standard]
-kafka-python
-pydantic
-psycopg2-binary
+# веб
+fastapi==0.111.0
+uvicorn[standard]==0.30.3
+
+# схемы/валидация
+pydantic==2.8.2
+
+# БД
 SQLAlchemy==2.0.32
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
+psycopg2-binary==2.9.9
+
+# разное
+kafka-python==2.0.2
+python-dateutil==2.9.0.post0
+typing_extensions==4.12.2

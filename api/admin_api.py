@@ -1,6 +1,6 @@
 # api/admin_api.py
-import os
-from typing import Optional, List, Literal, Dict, Any
+import os, time
+from typing import Optional, List, Literal, Dict, Any, Mapping
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -21,10 +21,16 @@ def require_admin(authorization: Optional[str] = Header(None)):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "Invalid token")
 
-def row_to_dict(row) -> dict:
-    return dict(row._mapping)
+# Универсальный конвертер и для Row, и для mappings()-результатов
+def row_to_dict(row: Any) -> dict:
+    if isinstance(row, Mapping):
+        return dict(row)
+    # SQLAlchemy Row: row._mapping
+    m = getattr(row, "_mapping", None)
+    return dict(m) if m is not None else dict(row)
 
 PaymentStatus = Literal["new", "processing", "approved", "declined", "failed"]
+RefundStatus  = Literal["requested", "succeeded", "failed"]
 
 class MerchantOut(BaseModel):
     id: UUID
@@ -66,28 +72,53 @@ class StatsOut(BaseModel):
     merchants_total: int
     payments_total: int
 
+class RefundOut(BaseModel):
+    refund_id: UUID
+    payment_id: UUID
+    amount: int
+    currency: str
+    status: RefundStatus
+    reason: Optional[str] = None
+    created_at: int
+
+class RefundsList(BaseModel):
+    items: List[RefundOut]
+    total: int
+    limit: int
+    offset: int
+
+class RefundCreate(BaseModel):
+    amount: int = Field(..., gt=0)
+    reason: Optional[str] = Field(None, max_length=200)
+    result: Optional[RefundStatus] = Field(None)
+
+class RefundSimulate(BaseModel):
+    amount: int = Field(..., gt=0)
+    reason: Optional[str] = Field(None, max_length=200)
+    success: bool = True
+
 # -------- Merchants --------
 @router.get("/merchants", response_model=List[MerchantOut])
 def list_merchants(_: None = Depends(require_admin)):
     with engine.begin() as conn:
-        res: Result = conn.execute(text("""
+        rows = conn.execute(text("""
             SELECT id, webhook_url, api_secret, api_key
               FROM merchants
              ORDER BY webhook_url
-        """))
-        return [row_to_dict(r) for r in res]
+        """)).mappings().all()
+        return [row_to_dict(r) for r in rows]
 
 @router.post("/merchants", response_model=MerchantOut, status_code=201)
 def create_merchant(body: MerchantCreate, _: None = Depends(require_admin)):
     new_id = str(uuid4())
     api_key = body.api_key or f"sk_live_{uuid4().hex}"
     with engine.begin() as conn:
-        res: Result = conn.execute(text("""
+        row = conn.execute(text("""
             INSERT INTO merchants (id, webhook_url, api_secret, api_key)
             VALUES (CAST(:id AS uuid), :webhook_url, :api_secret, :api_key)
          RETURNING id, webhook_url, api_secret, api_key
-        """), dict(id=new_id, webhook_url=body.webhook_url, api_secret=body.api_secret, api_key=api_key))
-        return row_to_dict(res.first())
+        """), dict(id=new_id, webhook_url=body.webhook_url, api_secret=body.api_secret, api_key=api_key)).mappings().first()
+        return row_to_dict(row)
 
 @router.patch("/merchants/{merchant_id}", response_model=MerchantOut)
 def update_merchant(merchant_id: UUID, body: MerchantUpdate, _: None = Depends(require_admin)):
@@ -103,12 +134,11 @@ def update_merchant(merchant_id: UUID, body: MerchantUpdate, _: None = Depends(r
         raise HTTPException(400, "Nothing to update")
 
     with engine.begin() as conn:
-        res: Result = conn.execute(text(f"""
+        row = conn.execute(text(f"""
             UPDATE merchants SET {", ".join(sets)}
              WHERE id = CAST(:id AS uuid)
          RETURNING id, webhook_url, api_secret, api_key
-        """), params)
-        row = res.first()
+        """), params).mappings().first()
         if not row:
             raise HTTPException(404, "Merchant not found")
         return row_to_dict(row)
@@ -126,7 +156,7 @@ def delete_merchant(merchant_id: UUID, _: None = Depends(require_admin)):
             raise HTTPException(404, "Merchant not found")
     return
 
-# -------- Payments: поиск/фильтры/детали --------
+# -------- Payments --------
 @router.get("/payments", response_model=PaymentsList)
 def list_payments(
     _: None = Depends(require_admin),
@@ -135,45 +165,24 @@ def list_payments(
     currency: Optional[str] = Query(None, min_length=3, max_length=3),
     amount_min: Optional[int] = Query(None, ge=1),
     amount_max: Optional[int] = Query(None, ge=1),
-    created_from: Optional[int] = Query(None, description="unix epoch"),
-    created_to: Optional[int] = Query(None, description="unix epoch (inclusive)"),
-    q: Optional[str] = Query(None, description="substr payment_id / idempotency_key / currency"),
+    created_from: Optional[int] = Query(None),
+    created_to: Optional[int] = Query(None, description="inclusive"),
+    q: Optional[str] = Query(None),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
     sort: Literal['created_at','amount'] = Query('created_at'),
     order: Literal['desc','asc'] = Query('desc'),
 ):
-    where = ["1=1"]
-    params: Dict[str, Any] = {}
-
-    if merchant_id:
-        where.append("p.merchant_id = CAST(:merchant_id AS uuid)")
-        params["merchant_id"] = str(merchant_id)
-    if status:
-        where.append("p.status = :status")
-        params["status"] = status
-    if currency:
-        where.append("p.currency = :currency")
-        params["currency"] = currency.upper()
-    if amount_min is not None:
-        where.append("p.amount >= :amount_min")
-        params["amount_min"] = amount_min
-    if amount_max is not None:
-        where.append("p.amount <= :amount_max")
-        params["amount_max"] = amount_max
-    if created_from is not None:
-        where.append("p.created_at >= :created_from")
-        params["created_from"] = created_from
-    if created_to is not None:
-        # inclusive верхняя граница: < (created_to + 1)
-        where.append("p.created_at < :created_to_excl")
-        params["created_to_excl"] = created_to + 1
+    where = ["1=1"]; params: Dict[str, Any] = {}
+    if merchant_id: where.append("p.merchant_id = CAST(:merchant_id AS uuid)"); params["merchant_id"] = str(merchant_id)
+    if status: where.append("p.status = :status"); params["status"] = status
+    if currency: where.append("p.currency = :currency"); params["currency"] = currency.upper()
+    if amount_min is not None: where.append("p.amount >= :amount_min"); params["amount_min"] = amount_min
+    if amount_max is not None: where.append("p.amount <= :amount_max"); params["amount_max"] = amount_max
+    if created_from is not None: where.append("p.created_at >= :created_from"); params["created_from"] = created_from
+    if created_to is not None: where.append("p.created_at < :created_to_excl"); params["created_to_excl"] = created_to + 1
     if q:
-        where.append("("
-                     "CAST(p.payment_id AS TEXT) ILIKE :q "
-                     "OR p.idempotency_key ILIKE :q "
-                     "OR p.currency ILIKE :q"
-                     ")")
+        where.append("(CAST(p.payment_id AS TEXT) ILIKE :q OR p.idempotency_key ILIKE :q OR p.currency ILIKE :q)")
         params["q"] = f"%{q}%"
 
     where_sql = " AND ".join(where)
@@ -193,7 +202,7 @@ def list_payments(
              LIMIT :limit OFFSET :offset
         """), {**params, "limit": limit, "offset": offset}).mappings().all()
 
-    items = [PaymentOut(**dict(r)) for r in rows]
+    items = [PaymentOut(**row_to_dict(r)) for r in rows]
     return PaymentsList(items=items, total=total, limit=limit, offset=offset)
 
 @router.get("/payments/{payment_id}", response_model=PaymentOut)
@@ -209,7 +218,7 @@ def get_payment(payment_id: UUID, _: None = Depends(require_admin)):
         """), {"pid": str(payment_id)}).mappings().first()
         if not row:
             raise HTTPException(404, "Payment not found")
-        return PaymentOut(**dict(row))
+        return PaymentOut(**row_to_dict(row))
 
 @router.patch("/payments/{payment_id}", response_model=PaymentOut)
 def update_payment_status(payment_id: UUID, body: PaymentUpdate, _: None = Depends(require_admin)):
@@ -240,11 +249,93 @@ def resend_webhook(payment_id: UUID, _: None = Depends(require_admin)):
         """), {"pid": str(payment_id)})
     return {"status": "queued"}
 
+# -------- Refunds --------
+def _get_payment_and_refunded_sum(conn, pid: str):
+    p = conn.execute(text("""
+        SELECT payment_id, amount, currency, status
+          FROM payments
+         WHERE payment_id = CAST(:pid AS uuid)
+    """), {"pid": pid}).mappings().first()
+    if not p:
+        raise HTTPException(404, "Payment not found")
+    refunded_sum = conn.execute(text("""
+        SELECT COALESCE(SUM(amount),0) AS s
+          FROM refunds
+         WHERE payment_id = CAST(:pid AS uuid) AND status = 'succeeded'
+    """), {"pid": pid}).scalar_one()
+    return p, int(refunded_sum or 0)
+
+@router.get("/refunds", response_model=RefundsList)
+def list_refunds(
+    _: None = Depends(require_admin),
+    payment_id: Optional[UUID] = Query(None),
+    status: Optional[RefundStatus] = Query(None),
+    created_from: Optional[int] = Query(None),
+    created_to: Optional[int] = Query(None, description="inclusive"),
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    order: Literal["asc","desc"] = Query("desc")
+):
+    where = ["1=1"]; params: Dict[str, Any] = {}
+    if payment_id: where.append("r.payment_id = CAST(:pid AS uuid)"); params["pid"] = str(payment_id)
+    if status: where.append("r.status = :status"); params["status"] = status
+    if created_from is not None: where.append("r.created_at >= :from"); params["from"] = created_from
+    if created_to is not None: where.append("r.created_at < :to_excl"); params["to_excl"] = created_to + 1
+    where_sql = " AND ".join(where)
+    direction = "ASC" if order == "asc" else "DESC"
+
+    with engine.begin() as conn:
+        total = conn.execute(text(f"SELECT COUNT(*) FROM refunds r WHERE {where_sql}"), params).scalar_one()
+        rows = conn.execute(text(f"""
+            SELECT refund_id, payment_id, amount, currency, status, reason, created_at
+              FROM refunds r
+             WHERE {where_sql}
+             ORDER BY created_at {direction}, refund_id
+             LIMIT :limit OFFSET :offset
+        """), {**params, "limit": limit, "offset": offset}).mappings().all()
+    return RefundsList(items=[RefundOut(**row_to_dict(r)) for r in rows], total=total, limit=limit, offset=offset)
+
+@router.get("/payments/{payment_id}/refunds", response_model=RefundsList)
+def list_payment_refunds(payment_id: UUID, _: None = Depends(require_admin), limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), order: Literal["asc","desc"] = Query("desc")):
+    return list_refunds(_, payment_id, None, None, None, limit, offset, order)
+
+@router.post("/payments/{payment_id}/refunds", response_model=RefundOut, status_code=201)
+def create_refund(payment_id: UUID, body: RefundCreate, _: None = Depends(require_admin)):
+    now = int(time.time())
+    with engine.begin() as conn:
+        p, refunded = _get_payment_and_refunded_sum(conn, str(payment_id))
+        if p["status"] != "approved":
+            raise HTTPException(409, "Refunds allowed only for approved (completed) payments")
+        remaining = int(p["amount"]) - refunded
+        if body.amount > remaining:
+            raise HTTPException(409, f"Refund amount exceeds remaining ({remaining})")
+        status: RefundStatus = body.result or "succeeded"
+        rid = str(uuid4())
+        row = conn.execute(text("""
+            INSERT INTO refunds (refund_id, payment_id, amount, currency, status, reason, created_at)
+            VALUES (CAST(:rid AS uuid), CAST(:pid AS uuid), :amount, :currency, :status, :reason, :created)
+         RETURNING refund_id, payment_id, amount, currency, status, reason, created_at
+        """), {
+            "rid": rid,
+            "pid": str(payment_id),
+            "amount": body.amount,
+            "currency": p["currency"],
+            "status": status,
+            "reason": body.reason,
+            "created": now
+        }).mappings().first()
+        return RefundOut(**row_to_dict(row))
+
+@router.post("/payments/{payment_id}/simulate-refund", response_model=RefundOut, status_code=201)
+def simulate_refund(payment_id: UUID, body: RefundSimulate, _: None = Depends(require_admin)):
+    result: RefundStatus = "succeeded" if body.success else "failed"
+    return create_refund(payment_id, RefundCreate(amount=body.amount, reason=body.reason, result=result), _)
+
 @router.get("/stats", response_model=StatsOut)
 def get_stats(_: None = Depends(require_admin)):
     with engine.begin() as conn:
-        rows = conn.execute(text("SELECT status, COUNT(*) AS cnt FROM payments GROUP BY status")).all()
-        counts = {r.status: r.cnt for r in rows}
-        merchants_total = conn.execute(text("SELECT COUNT(*) FROM merchants")).scalar_one()
-        payments_total = conn.execute(text("SELECT COUNT(*) FROM payments")).scalar_one()
+        rows = conn.execute(text("SELECT status, COUNT(*) AS cnt FROM payments GROUP BY status")).mappings().all()
+        counts = {str(r["status"]): int(r["cnt"]) for r in rows}
+        merchants_total = int(conn.execute(text("SELECT COUNT(*) FROM merchants")).scalar_one())
+        payments_total = int(conn.execute(text("SELECT COUNT(*) FROM payments")).scalar_one())
     return StatsOut(counts_by_status=counts, merchants_total=merchants_total, payments_total=payments_total)

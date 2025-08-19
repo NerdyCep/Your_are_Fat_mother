@@ -1,12 +1,26 @@
-# ---------- load_test.sh ----------
 #!/usr/bin/env bash
 set -euo pipefail
 
-# >>>>>>>>>>>>>> НАСТРОЙКИ (переопределяй через env) <<<<<<<<<<<<<<
-API_URL="${API_URL:-http://localhost:8000}"
-API_KEY="${API_KEY:-sk_live_0b85ac22a90a4019b0e79d07b672cf34}"   # ключ мерчанта для /v1/payments
-ADMIN_TOKEN="${ADMIN_TOKEN:-dev-admin}"                           # токен админ-API для /admin-api/*
-POSTGRES_CONT="${POSTGRES_CONT:-postgres}"                        # имя сервиса/контейнера postgres
+# ---------- autodetect API_URL ----------
+DEFAULT_URL_1="http://localhost:8080"
+DEFAULT_URL_2="http://localhost:8000"
+API_URL="${API_URL:-}"
+
+try_url () { curl -fsS "$1/health" >/dev/null 2>&1; }
+
+if [ -z "$API_URL" ]; then
+  if try_url "$DEFAULT_URL_1"; then
+    API_URL="$DEFAULT_URL_1"
+  elif try_url "$DEFAULT_URL_2"; then
+    API_URL="$DEFAULT_URL_2"
+  else
+    API_URL="$DEFAULT_URL_1"  # по умолчанию 8080
+  fi
+fi
+
+API_KEY="${API_KEY:-sk_live_0b85ac22a90a4019b0e79d07b672cf34}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-dev-admin}"
+POSTGRES_CONT="${POSTGRES_CONT:-postgres}"
 DB_NAME="${DB_NAME:-payments}"
 
 post_json='{"amount":101,"currency":"USD","order_id":"lt"}'
@@ -27,10 +41,9 @@ psql_exec () {
   fi
 }
 
-# helper: проверить, что в merchants есть наш API_KEY; если нет — создать через админ-API
+# helper: проверить наличие мерчанта с API_KEY (через админ-API)
 ensure_merchant () {
   echo "[i] Проверяю, что в БД есть мерчант с заданным API_KEY..."
-  # попробуем получить список через админ-API (если токен ок)
   local list_code
   list_code=$(curl -s -o /tmp/merchants.json -w '%{http_code}' \
     -H "Authorization: Bearer $ADMIN_TOKEN" "$API_URL/admin-api/merchants" || true)
@@ -50,7 +63,7 @@ ensure_merchant () {
     if [[ "$create_code" == "201" || "$create_code" == "409" ]]; then
       echo "[i] Мерчант создан или уже существовал (HTTP $create_code)"
     else
-      echo "[!] Не удалось создать мерчанта через админ-API (HTTP $create_code), продолжаю без авто-создания."
+      echo "[!] Не удалось создать мерчанта через админ-API (HTTP $create_code)."
       echo "    Ответ: $(cat /tmp/merchant_create.json)"
     fi
   else
@@ -60,18 +73,24 @@ ensure_merchant () {
 
 # 0) Healthcheck API
 echo "[i] Проверяю /health..."
-curl -fsS "$API_URL/health" && echo -e "\n[i] /health OK\n" || { echo "[!] API недоступен"; exit 1; }
+if curl -fsS "$API_URL/health" >/dev/null 2>&1; then
+  echo "[i] /health OK"
+else
+  echo "[!] API недоступен по $API_URL"
+  echo "    Подними сервис:  docker compose up -d api"
+  exit 1
+fi
+echo
 
-# 0.1) Убедимся, что есть мерчант с нужным API_KEY (опционально, если админ-API доступен)
+# 0.1) ensure merchant (опционально)
 ensure_merchant || true
 
-# ---------- ТЕСТ 1: ИДЕМПОТЕНТНОСТЬ (один ключ) ----------
+# ---------- ТЕСТ 1: ИДЕМПОТЕНТНОСТЬ ----------
 echo "=== ТЕСТ 1: 200 параллельных запросов с одним Idempotency-Key ==="
 IDEMP1="idem-same-key-$(date +%s)"
 echo "[i] Idempotency-Key=$IDEMP1"
 echo "[i] Шлю 200 POST с конкуренцией 50, собираю распределение HTTP кодов..."
 
-# выведем распределение HTTP-кодов
 seq 200 | xargs -I{} -P 50 sh -c \
 "curl -s -o /dev/null -w '%{http_code}\n' \
   -X POST '$API_URL/v1/payments' \
@@ -81,7 +100,6 @@ seq 200 | xargs -I{} -P 50 sh -c \
   -d '$post_json'" \
 | sort | uniq -c
 
-# Проверка в БД: COUNT должен быть 1
 echo
 echo "[i] Проверяю в БД, что запись по '$IDEMP1' одна:"
 psql_exec "
@@ -110,10 +128,10 @@ SELECT COUNT(*) AS unique_rows
 FROM payments
 WHERE idempotency_key LIKE 'idem-unique-%';"
 
-# ---------- ТЕСТ 3 (опционально): oha 60s ----------
+# ---------- ТЕСТ 3: oha (опционально) ----------
 echo
 if command -v oha >/dev/null 2>&1; then
-  echo "=== ТЕСТ 3: oha 60s (-c 10, -q 2) с уникальными ключами ==="
+  echo "=== ТЕСТ 3: oha 60s (-c 10, -q 2) ==="
   oha -z 60s -c 10 -q 2 -m POST \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \
@@ -121,7 +139,7 @@ if command -v oha >/dev/null 2>&1; then
     -d "$post_json" \
     "$API_URL/v1/payments"
 else
-  echo "[i] oha не найден. Пропускаю тест 3. Установить: brew install oha"
+  echo "[i] oha не найден. Пропускаю тест 3. (brew install oha)"
 fi
 
 # ---------- Сводка ----------
@@ -143,4 +161,3 @@ LIMIT 10;"
 
 echo
 echo "[✓] Нагрузочные тесты завершены."
-# ---------- /load_test.sh ----------
