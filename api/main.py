@@ -7,12 +7,27 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kafka import KafkaProducer
 
 from admin_api import router as admin_router  # <— импортируем
-app = FastAPI()
+app = FastAPI(title="Payments Admin API")
 app.include_router(admin_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(admin_router)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 # -------------------------------------------------------------------
 # Конфигурация

@@ -1,5 +1,6 @@
+# api/admin_api.py
 import os
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -9,6 +10,10 @@ from sqlalchemy.engine import Engine, Result
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin")
+DB_DSN = os.getenv("DB_DSN", "postgresql+psycopg2://postgres:postgres@postgres:5432/payments")
+engine: Engine = create_engine(DB_DSN, pool_pre_ping=True)
+
+router = APIRouter(prefix="/admin-api", tags=["admin"])
 
 def require_admin(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -17,10 +22,10 @@ def require_admin(authorization: Optional[str] = Header(None)):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "Invalid token")
 
-DB_DSN = os.getenv("DB_DSN", "postgresql+psycopg2://postgres:postgres@postgres:5432/payments")
-engine: Engine = create_engine(DB_DSN, pool_pre_ping=True)
+def row_to_dict(row) -> dict:
+    return dict(row._mapping)
 
-router = APIRouter(prefix="/admin-api", tags=["admin-api"])
+PaymentStatus = Literal["new", "processing", "approved", "declined", "failed"]
 
 class MerchantOut(BaseModel):
     id: UUID
@@ -31,14 +36,12 @@ class MerchantOut(BaseModel):
 class MerchantCreate(BaseModel):
     webhook_url: str = Field(..., min_length=4)
     api_secret: str = Field(..., min_length=1)
-    api_key: Optional[str] = None  # можно задать руками
+    api_key: Optional[str] = None
 
 class MerchantUpdate(BaseModel):
     webhook_url: Optional[str] = Field(None, min_length=4)
     api_secret: Optional[str] = Field(None, min_length=1)
     api_key: Optional[str] = Field(None, min_length=1)
-
-PaymentStatus = Literal["new","processing","approved","declined","failed"]
 
 class PaymentOut(BaseModel):
     payment_id: UUID
@@ -53,10 +56,17 @@ class PaymentOut(BaseModel):
 class PaymentUpdate(BaseModel):
     status: PaymentStatus
 
-def row_to_dict(row) -> dict:
-    return dict(row._mapping)
+class PaymentsList(BaseModel):
+    items: List[PaymentOut]
+    total: int
+    limit: int
+    offset: int
 
-# ---------- MERCHANTS ----------
+class StatsOut(BaseModel):
+    counts_by_status: Dict[str, int]
+    merchants_total: int
+    payments_total: int
+
 @router.get("/merchants", response_model=List[MerchantOut])
 def list_merchants(_: None = Depends(require_admin)):
     with engine.begin() as conn:
@@ -83,13 +93,11 @@ def create_merchant(body: MerchantCreate, _: None = Depends(require_admin)):
         raise HTTPException(409, detail=f"Integrity error: {str(e.orig)}")
     except SQLAlchemyError as e:
         raise HTTPException(500, detail=f"DB error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(500, detail=f"Unexpected: {str(e)}")
 
 @router.patch("/merchants/{merchant_id}", response_model=MerchantOut)
 def update_merchant(merchant_id: UUID, body: MerchantUpdate, _: None = Depends(require_admin)):
     sets = []
-    params = {"id": str(merchant_id)}
+    params: Dict[str, Any] = {"id": str(merchant_id)}
     if body.webhook_url is not None:
         sets.append("webhook_url = :webhook_url"); params["webhook_url"] = body.webhook_url
     if body.api_secret is not None:
@@ -128,30 +136,73 @@ def delete_merchant(merchant_id: UUID, _: None = Depends(require_admin)):
             raise HTTPException(404, "Merchant not found")
     return
 
-# ---------- PAYMENTS ----------
-@router.get("/payments", response_model=List[PaymentOut])
+@router.get("/payments", response_model=PaymentsList)
 def list_payments(
     _: None = Depends(require_admin),
-    q: Optional[str] = Query(None),
+    merchant_id: Optional[UUID] = Query(None),
     status: Optional[PaymentStatus] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    currency: Optional[str] = Query(None, min_length=3, max_length=3),
+    amount_min: Optional[int] = Query(None, ge=1),
+    amount_max: Optional[int] = Query(None, ge=1),
+    created_from: Optional[int] = Query(None, description="unix epoch, inclusive"),
+    created_to: Optional[int] = Query(None, description="unix epoch, inclusive"),
+    q: Optional[str] = Query(None, description="substring по payment_id / idempotency_key / currency"),
+    limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    sort: Literal['created_at','amount'] = Query('created_at'),
+    order: Literal['desc','asc'] = Query('desc'),
 ):
-    where = ["1=1"]; params = {}
-    if q: where.append("(p.idempotency_key ILIKE :q OR p.currency ILIKE :q)"); params["q"] = f"%{q}%"
-    if status: where.append("p.status = :status"); params["status"] = status
+    where = ["1=1"]
+    params: Dict[str, Any] = {}
+
+    if merchant_id:
+        where.append("p.merchant_id = CAST(:merchant_id AS uuid)")
+        params["merchant_id"] = str(merchant_id)
+    if status:
+        where.append("p.status = :status")
+        params["status"] = status
+    if currency:
+        where.append("p.currency = :currency")
+        params["currency"] = currency.upper()
+    if amount_min is not None:
+        where.append("p.amount >= :amount_min")
+        params["amount_min"] = amount_min
+    if amount_max is not None:
+        where.append("p.amount <= :amount_max")
+        params["amount_max"] = amount_max
+    if created_from is not None:
+        where.append("p.created_at >= :created_from")
+        params["created_from"] = created_from
+    if created_to is not None:
+        where.append("p.created_at <= :created_to")
+        params["created_to"] = created_to
+    if q:
+        where.append("("
+                     "CAST(p.payment_id AS TEXT) ILIKE :q "
+                     "OR p.idempotency_key ILIKE :q "
+                     "OR p.currency ILIKE :q"
+                     ")")
+        params["q"] = f"%{q}%"
+
+    where_sql = " AND ".join(where)
+    sort_col = "p.created_at" if sort == "created_at" else "p.amount"
+    direction = "DESC" if order == "desc" else "ASC"
+
     with engine.begin() as conn:
-        res: Result = conn.execute(text(f"""
+        total = conn.execute(text(f"SELECT COUNT(*) FROM payments p WHERE {where_sql}"), params).scalar_one()
+        rows = conn.execute(text(f"""
             SELECT p.payment_id, p.merchant_id, p.amount, p.currency, p.status,
                    p.idempotency_key, p.created_at,
                    m.webhook_url AS merchant_webhook_url
               FROM payments p
               LEFT JOIN merchants m ON m.id = p.merchant_id
-             WHERE {" AND ".join(where)}
-             ORDER BY p.created_at DESC
+             WHERE {where_sql}
+             ORDER BY {sort_col} {direction}, p.payment_id
              LIMIT :limit OFFSET :offset
-        """), {**params, "limit": limit, "offset": offset})
-        return [row_to_dict(r) for r in res]
+        """), {**params, "limit": limit, "offset": offset}).mappings().all()
+
+    items = [PaymentOut(**dict(r)) for r in rows]
+    return PaymentsList(items=items, total=total, limit=limit, offset=offset)
 
 @router.patch("/payments/{payment_id}", response_model=PaymentOut)
 def update_payment_status(payment_id: UUID, body: PaymentUpdate, _: None = Depends(require_admin)):
@@ -165,7 +216,8 @@ def update_payment_status(payment_id: UUID, body: PaymentUpdate, _: None = Depen
                    (SELECT webhook_url FROM merchants m WHERE m.id = payments.merchant_id) AS merchant_webhook_url
         """), {"pid": str(payment_id), "status": body.status})
         row = res.first()
-        if not row: raise HTTPException(404, "Payment not found")
+        if not row:
+            raise HTTPException(404, "Payment not found")
         return row_to_dict(row)
 
 @router.post("/payments/{payment_id}/resend-webhook", status_code=202)
@@ -174,18 +226,14 @@ def resend_webhook(payment_id: UUID, _: None = Depends(require_admin)):
         exists = conn.execute(text("""
             SELECT 1 FROM payments WHERE payment_id = CAST(:pid AS uuid)
         """), {"pid": str(payment_id)}).first()
-        if not exists: raise HTTPException(404, "Payment not found")
+        if not exists:
+            raise HTTPException(404, "Payment not found")
         conn.execute(text("""
             INSERT INTO webhook_outbox (payment_id, delivered)
                  VALUES (CAST(:pid AS uuid), FALSE)
             ON CONFLICT (payment_id) DO UPDATE SET delivered = FALSE
         """), {"pid": str(payment_id)})
     return {"status": "queued"}
-
-class StatsOut(BaseModel):
-    counts_by_status: dict
-    merchants_total: int
-    payments_total: int
 
 @router.get("/stats", response_model=StatsOut)
 def get_stats(_: None = Depends(require_admin)):
