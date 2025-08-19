@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Result
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin")
 DB_DSN = os.getenv("DB_DSN", "postgresql+psycopg2://postgres:postgres@postgres:5432/payments")
@@ -67,6 +66,7 @@ class StatsOut(BaseModel):
     merchants_total: int
     payments_total: int
 
+# -------- Merchants --------
 @router.get("/merchants", response_model=List[MerchantOut])
 def list_merchants(_: None = Depends(require_admin)):
     with engine.begin() as conn:
@@ -81,18 +81,13 @@ def list_merchants(_: None = Depends(require_admin)):
 def create_merchant(body: MerchantCreate, _: None = Depends(require_admin)):
     new_id = str(uuid4())
     api_key = body.api_key or f"sk_live_{uuid4().hex}"
-    try:
-        with engine.begin() as conn:
-            res: Result = conn.execute(text("""
-                INSERT INTO merchants (id, webhook_url, api_secret, api_key)
-                VALUES (CAST(:id AS uuid), :webhook_url, :api_secret, :api_key)
-             RETURNING id, webhook_url, api_secret, api_key
-            """), dict(id=new_id, webhook_url=body.webhook_url, api_secret=body.api_secret, api_key=api_key))
-            return row_to_dict(res.first())
-    except IntegrityError as e:
-        raise HTTPException(409, detail=f"Integrity error: {str(e.orig)}")
-    except SQLAlchemyError as e:
-        raise HTTPException(500, detail=f"DB error: {str(e)}")
+    with engine.begin() as conn:
+        res: Result = conn.execute(text("""
+            INSERT INTO merchants (id, webhook_url, api_secret, api_key)
+            VALUES (CAST(:id AS uuid), :webhook_url, :api_secret, :api_key)
+         RETURNING id, webhook_url, api_secret, api_key
+        """), dict(id=new_id, webhook_url=body.webhook_url, api_secret=body.api_secret, api_key=api_key))
+        return row_to_dict(res.first())
 
 @router.patch("/merchants/{merchant_id}", response_model=MerchantOut)
 def update_merchant(merchant_id: UUID, body: MerchantUpdate, _: None = Depends(require_admin)):
@@ -107,21 +102,16 @@ def update_merchant(merchant_id: UUID, body: MerchantUpdate, _: None = Depends(r
     if not sets:
         raise HTTPException(400, "Nothing to update")
 
-    try:
-        with engine.begin() as conn:
-            res: Result = conn.execute(text(f"""
-                UPDATE merchants SET {", ".join(sets)}
-                 WHERE id = CAST(:id AS uuid)
-             RETURNING id, webhook_url, api_secret, api_key
-            """), params)
-            row = res.first()
-            if not row:
-                raise HTTPException(404, "Merchant not found")
-            return row_to_dict(row)
-    except IntegrityError as e:
-        raise HTTPException(409, detail=f"Integrity error: {str(e.orig)}")
-    except SQLAlchemyError as e:
-        raise HTTPException(500, detail=f"DB error: {str(e)}")
+    with engine.begin() as conn:
+        res: Result = conn.execute(text(f"""
+            UPDATE merchants SET {", ".join(sets)}
+             WHERE id = CAST(:id AS uuid)
+         RETURNING id, webhook_url, api_secret, api_key
+        """), params)
+        row = res.first()
+        if not row:
+            raise HTTPException(404, "Merchant not found")
+        return row_to_dict(row)
 
 @router.delete("/merchants/{merchant_id}", status_code=204)
 def delete_merchant(merchant_id: UUID, _: None = Depends(require_admin)):
@@ -136,6 +126,7 @@ def delete_merchant(merchant_id: UUID, _: None = Depends(require_admin)):
             raise HTTPException(404, "Merchant not found")
     return
 
+# -------- Payments: поиск/фильтры/детали --------
 @router.get("/payments", response_model=PaymentsList)
 def list_payments(
     _: None = Depends(require_admin),
@@ -144,9 +135,9 @@ def list_payments(
     currency: Optional[str] = Query(None, min_length=3, max_length=3),
     amount_min: Optional[int] = Query(None, ge=1),
     amount_max: Optional[int] = Query(None, ge=1),
-    created_from: Optional[int] = Query(None, description="unix epoch, inclusive"),
-    created_to: Optional[int] = Query(None, description="unix epoch, inclusive"),
-    q: Optional[str] = Query(None, description="substring по payment_id / idempotency_key / currency"),
+    created_from: Optional[int] = Query(None, description="unix epoch"),
+    created_to: Optional[int] = Query(None, description="unix epoch (inclusive)"),
+    q: Optional[str] = Query(None, description="substr payment_id / idempotency_key / currency"),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
     sort: Literal['created_at','amount'] = Query('created_at'),
@@ -174,8 +165,9 @@ def list_payments(
         where.append("p.created_at >= :created_from")
         params["created_from"] = created_from
     if created_to is not None:
-        where.append("p.created_at <= :created_to")
-        params["created_to"] = created_to
+        # inclusive верхняя граница: < (created_to + 1)
+        where.append("p.created_at < :created_to_excl")
+        params["created_to_excl"] = created_to + 1
     if q:
         where.append("("
                      "CAST(p.payment_id AS TEXT) ILIKE :q "
@@ -204,18 +196,32 @@ def list_payments(
     items = [PaymentOut(**dict(r)) for r in rows]
     return PaymentsList(items=items, total=total, limit=limit, offset=offset)
 
+@router.get("/payments/{payment_id}", response_model=PaymentOut)
+def get_payment(payment_id: UUID, _: None = Depends(require_admin)):
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT p.payment_id, p.merchant_id, p.amount, p.currency, p.status,
+                   p.idempotency_key, p.created_at,
+                   m.webhook_url AS merchant_webhook_url
+              FROM payments p
+              LEFT JOIN merchants m ON m.id = p.merchant_id
+             WHERE p.payment_id = CAST(:pid AS uuid)
+        """), {"pid": str(payment_id)}).mappings().first()
+        if not row:
+            raise HTTPException(404, "Payment not found")
+        return PaymentOut(**dict(row))
+
 @router.patch("/payments/{payment_id}", response_model=PaymentOut)
 def update_payment_status(payment_id: UUID, body: PaymentUpdate, _: None = Depends(require_admin)):
     with engine.begin() as conn:
-        res: Result = conn.execute(text("""
+        row = conn.execute(text("""
             UPDATE payments
                SET status = :status
              WHERE payment_id = CAST(:pid AS uuid)
          RETURNING payment_id, merchant_id, amount, currency, status,
                    idempotency_key, created_at,
                    (SELECT webhook_url FROM merchants m WHERE m.id = payments.merchant_id) AS merchant_webhook_url
-        """), {"pid": str(payment_id), "status": body.status})
-        row = res.first()
+        """), {"pid": str(payment_id), "status": body.status}).mappings().first()
         if not row:
             raise HTTPException(404, "Payment not found")
         return row_to_dict(row)
@@ -223,9 +229,8 @@ def update_payment_status(payment_id: UUID, body: PaymentUpdate, _: None = Depen
 @router.post("/payments/{payment_id}/resend-webhook", status_code=202)
 def resend_webhook(payment_id: UUID, _: None = Depends(require_admin)):
     with engine.begin() as conn:
-        exists = conn.execute(text("""
-            SELECT 1 FROM payments WHERE payment_id = CAST(:pid AS uuid)
-        """), {"pid": str(payment_id)}).first()
+        exists = conn.execute(text("SELECT 1 FROM payments WHERE payment_id = CAST(:pid AS uuid)"),
+                              {"pid": str(payment_id)}).first()
         if not exists:
             raise HTTPException(404, "Payment not found")
         conn.execute(text("""

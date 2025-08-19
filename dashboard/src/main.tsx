@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import {
   api, Payment, Merchant, Stats, PaymentStatus,
   listMerchants, createMerchant, updateMerchant, deleteMerchant,
-  listPayments, updatePaymentStatus, resendWebhook, getStats
+  listPayments, getPayment, updatePaymentStatus, resendWebhook, getStats
 } from "./api";
 
 type Tab = "payments" | "merchants" | "stats";
@@ -50,37 +50,55 @@ function useDebounced<T>(value: T, ms = 400) {
   return v;
 }
 
+function addDays(d: Date, days: number) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+function isoLocal(d: Date) {
+  const pad = (n:number)=>String(n).padStart(2,"0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth()+1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mi = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+
 function Payments() {
-  // filters
+  // filters/state
   const [q, setQ] = React.useState("");
   const [merchantId, setMerchantId] = React.useState("");
   const [status, setStatus] = React.useState<PaymentStatus | "">("");
   const [currency, setCurrency] = React.useState("");
   const [amountMin, setAmountMin] = React.useState<number | "">("");
   const [amountMax, setAmountMax] = React.useState<number | "">("");
-  const [createdFrom, setCreatedFrom] = React.useState(""); // datetime-local
-  const [createdTo, setCreatedTo] = React.useState("");     // datetime-local
+  const [createdFrom, setCreatedFrom] = React.useState("");
+  const [createdTo, setCreatedTo] = React.useState("");
   const [sort, setSort] = React.useState<"created_at"|"amount">("created_at");
   const [order, setOrder] = React.useState<"asc"|"desc">("desc");
-
-  // paging
   const [limit, setLimit] = React.useState(25);
   const [offset, setOffset] = React.useState(0);
 
-  // data
   const [items, setItems] = React.useState<Payment[]>([]);
   const [total, setTotal] = React.useState(0);
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
+  const [details, setDetails] = React.useState<Payment | null>(null);
 
   const debouncedQ = useDebounced(q, 400);
 
+  // to epoch seconds
   const epochFrom = React.useMemo(() => createdFrom ? Math.floor(new Date(createdFrom).getTime() / 1000) : undefined, [createdFrom]);
-  const epochTo   = React.useMemo(() => createdTo   ? Math.floor(new Date(createdTo).getTime()   / 1000) : undefined, [createdTo]);
+  const epochTo   = React.useMemo(() => {
+    if (!createdTo) return undefined;
+    // делаем верхнюю границу инклюзивной на бэке (< to+1), здесь просто округлим вниз до сек.
+    return Math.floor(new Date(createdTo).getTime() / 1000);
+  }, [createdTo]);
 
-  const statuses: PaymentStatus[] = ["new", "processing", "approved", "declined", "failed"];
-
-  React.useEffect(() => { setOffset(0); }, [debouncedQ, merchantId, status, currency, amountMin, amountMax, createdFrom, createdTo, sort, order, limit]);
+  React.useEffect(() => { setOffset(0); }, [
+    debouncedQ, merchantId, status, currency, amountMin, amountMax, createdFrom, createdTo, sort, order, limit
+  ]);
 
   async function load() {
     setLoading(true);
@@ -103,24 +121,51 @@ function Payments() {
       setErr(e.message || String(e));
     } finally { setLoading(false); }
   }
-
-  React.useEffect(() => { void load(); }, [debouncedQ, merchantId, status, currency, amountMin, amountMax, epochFrom, epochTo, sort, order, limit, offset]);
+  React.useEffect(() => { void load(); }, [
+    debouncedQ, merchantId, status, currency, amountMin, amountMax, epochFrom, epochTo, sort, order, limit, offset
+  ]);
 
   const totalPages = Math.max(1, Math.ceil(total / limit));
   const currentPage = Math.floor(offset / limit) + 1;
 
+  // period presets
+  function setPreset(days: number) {
+    const now = new Date();
+    const from = addDays(now, -days);
+    setCreatedFrom(isoLocal(from));
+    setCreatedTo(isoLocal(now));
+  }
+
+  // sortable headers
+  function toggleSort(next: "created_at" | "amount") {
+    if (sort === next) {
+      setOrder(prev => (prev === "desc" ? "asc" : "desc"));
+    } else {
+      setSort(next);
+      setOrder("desc"); // дефолт
+    }
+  }
+  const sortArrow = (col: "created_at" | "amount") =>
+    sort !== col ? "" : (order === "desc" ? " ↓" : " ↑");
+
+  async function openDetails(id: string) {
+    const p = await getPayment(id);
+    setDetails(p);
+    (document.getElementById("payment-modal") as HTMLDialogElement | null)?.showModal();
+  }
+
   return (
     <div className="card">
-      <h3>Payments — History & Filters</h3>
+      <h3>Transactions — поиск по дате, сумме, статусу</h3>
 
       <div className="row" style={{flexWrap:"wrap", alignItems:"center"}}>
-        <input placeholder="Search (payment_id / idem / currency)" value={q} onChange={e=>setQ(e.target.value)} />
+        <input placeholder="Поиск (payment_id / idem / currency)" value={q} onChange={e=>setQ(e.target.value)} />
         <input placeholder="Merchant ID (UUID)" value={merchantId} onChange={e=>setMerchantId(e.target.value)} />
         <select value={status} onChange={e=>setStatus((e.target.value || "") as PaymentStatus | "")}>
           <option value="">— status —</option>
-          {statuses.map(s => <option key={s} value={s}>{s}</option>)}
+          {["new","processing","approved","declined","failed"].map(s => <option key={s} value={s}>{s}</option>)}
         </select>
-        <input placeholder="Currency (USD)" value={currency} onChange={e=>setCurrency(e.target.value)} />
+        <input placeholder="Currency (USD)" value={currency} onChange={e=>setCurrency(e.target.value.toUpperCase())} />
         <input type="number" placeholder="Amount ≥" value={amountMin} onChange={e=>setAmountMin(e.target.value === "" ? "" : Number(e.target.value))}/>
         <input type="number" placeholder="Amount ≤" value={amountMax} onChange={e=>setAmountMax(e.target.value === "" ? "" : Number(e.target.value))}/>
       </div>
@@ -128,6 +173,12 @@ function Payments() {
       <div className="row" style={{flexWrap:"wrap", marginTop:8, alignItems:"center"}}>
         <label>From: <input type="datetime-local" value={createdFrom} onChange={e=>setCreatedFrom(e.target.value)} /></label>
         <label>To: <input type="datetime-local" value={createdTo} onChange={e=>setCreatedTo(e.target.value)} /></label>
+        <div className="row">
+          <button onClick={()=>setPreset(1)}>24h</button>
+          <button onClick={()=>setPreset(7)}>7d</button>
+          <button onClick={()=>setPreset(30)}>30d</button>
+          <button onClick={()=>{ setCreatedFrom(""); setCreatedTo(""); }}>Clear</button>
+        </div>
         <label>Sort:
           <select value={sort} onChange={e=>setSort(e.target.value as any)}>
             <option value="created_at">created_at</option>
@@ -142,28 +193,40 @@ function Payments() {
         </label>
         <button onClick={()=>void load()} disabled={loading}>{loading ? "Loading..." : "Apply"}</button>
         <span className="muted" style={{marginLeft:"auto"}}>Found: {total}</span>
+        {err && <span style={{color:"crimson"}}>{err}</span>}
       </div>
 
       <div style={{overflowX:"auto", marginTop:12}}>
         <table>
           <thead>
             <tr>
-              <th>Payment</th><th>Amount</th><th>Curr</th><th>Status</th><th>Idempotency</th><th>Merchant</th><th>Created</th><th>Actions</th>
+              <th>Payment</th>
+              <th onClick={()=>toggleSort("amount")} style={{cursor:"pointer"}}>Amount{sortArrow("amount")}</th>
+              <th>Curr</th>
+              <th>Status</th>
+              <th>Idempotency</th>
+              <th>Merchant</th>
+              <th onClick={()=>toggleSort("created_at")} style={{cursor:"pointer"}}>Created{sortArrow("created_at")}</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {items.map(p => (
               <tr key={p.payment_id}>
-                <td><code title={p.payment_id}>{p.payment_id.slice(0,8)}…</code></td>
+                <td>
+                  <a href="#" onClick={(e)=>{e.preventDefault(); void openDetails(p.payment_id);}}>
+                    <code title={p.payment_id}>{p.payment_id.slice(0,8)}…</code>
+                  </a>
+                </td>
                 <td>{p.amount}</td>
                 <td>{p.currency}</td>
                 <td>
                   <select value={p.status} onChange={async (e) => {
                     const np = await updatePaymentStatus(p.payment_id, e.target.value as PaymentStatus);
-                    // локально патчим строку
+                    (document.activeElement as HTMLElement | null)?.blur();
                     setItems(prev => prev.map(x => x.payment_id===p.payment_id ? np : x));
                   }}>
-                    {statuses.map(s => <option key={s} value={s}>{s}</option>)}
+                    {(["new","processing","approved","declined","failed"] as PaymentStatus[]).map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </td>
                 <td className="muted">{p.idempotency_key || "—"}</td>
@@ -188,9 +251,31 @@ function Payments() {
           {[10,25,50,100,200].map(n => <option key={n} value={n}>{n}</option>)}
         </select>
         <button onClick={()=>setOffset(Math.max(0, offset - limit))} disabled={offset===0 || loading}>← Prev</button>
-        <span>Page {currentPage} / {Math.max(1, totalPages)}</span>
+        <span>Page {currentPage} / {Math.max(1, Math.ceil(total/limit))}</span>
         <button onClick={()=>setOffset(offset + limit)} disabled={offset + limit >= total || loading}>Next →</button>
       </div>
+
+      {/* details modal */}
+      <dialog id="payment-modal">
+        <div style={{padding:"12px 16px", borderBottom:"1px solid #eee", display:"flex", justifyContent:"space-between"}}>
+          <strong>Transaction details</strong>
+          <button onClick={() => (document.getElementById("payment-modal") as HTMLDialogElement).close()}>✕</button>
+        </div>
+        <div style={{padding:"12px 16px"}}>
+          {!details ? <p className="muted">Loading…</p> : (
+            <>
+              <p><b>Payment ID:</b> <code>{details.payment_id}</code></p>
+              <p><b>Status:</b> {details.status}</p>
+              <p><b>Amount:</b> {details.amount} {details.currency}</p>
+              <p><b>Merchant:</b> {details.merchant_id || "—"}</p>
+              <p><b>Idempotency:</b> {details.idempotency_key || "—"}</p>
+              <p><b>Created:</b> {new Date(details.created_at*1000).toISOString()}</p>
+              <hr />
+              <pre style={{whiteSpace:"pre-wrap"}}>{JSON.stringify(details, null, 2)}</pre>
+            </>
+          )}
+        </div>
+      </dialog>
     </div>
   );
 }
@@ -237,15 +322,9 @@ function Merchants() {
             {items.map(m => (
               <tr key={m.id}>
                 <td><code title={m.id}>{m.id.slice(0,8)}…</code></td>
-                <td>
-                  <input value={m.webhook_url} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, webhook_url:e.target.value} : x))} />
-                </td>
-                <td>
-                  <input value={m.api_secret} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, api_secret:e.target.value} : x))} />
-                </td>
-                <td>
-                  <input value={m.api_key || ""} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, api_key:e.target.value} : x))} />
-                </td>
+                <td><input value={m.webhook_url} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, webhook_url:e.target.value} : x))} /></td>
+                <td><input value={m.api_secret} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, api_secret:e.target.value} : x))} /></td>
+                <td><input value={m.api_key || ""} onChange={e => setItems(prev => prev.map(x => x.id===m.id ? {...x, api_key:e.target.value} : x))} /></td>
                 <td className="row">
                   <button onClick={async ()=>{
                     const cur = items.find(x=>x.id===m.id)!;

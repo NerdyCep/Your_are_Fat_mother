@@ -1,0 +1,18 @@
+# --- Web framework ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+
+# --- Database ---
+sqlalchemy==2.0.32
+psycopg2-binary==2.9.9
+
+# --- Pydantic (валидация) ---
+pydantic==2.8.2
+pydantic-settings==2.3.4
+
+# --- Utils ---
+python-dotenv==1.0.1
+
+# --- Optional (для удобной работы с временем и JSON) ---
+orjson==3.10.6
+python-dateutil==2.9.0.post0

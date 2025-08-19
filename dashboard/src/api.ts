@@ -71,6 +71,7 @@ function toQuery(params: Record<string, unknown>) {
   return q.toString();
 }
 
+// Merchants
 export function listMerchants(): Promise<Merchant[]> { return http<Merchant[]>("/merchants"); }
 export function createMerchant(webhook_url: string, api_secret: string, api_key?: string): Promise<Merchant> {
   return http<Merchant>("/merchants", { method:"POST", body: JSON.stringify({ webhook_url, api_secret, api_key }) });
@@ -80,6 +81,7 @@ export function updateMerchant(id: string, patch: Partial<Pick<Merchant, "webhoo
 }
 export function deleteMerchant(id: string): Promise<void> { return http<void>(`/merchants/${id}`, { method:"DELETE" }); }
 
+// Payments
 export function listPayments(params: {
   q?: string;
   merchant_id?: string;
@@ -98,6 +100,10 @@ export function listPayments(params: {
   return http<PaymentsResponse>(`/payments?${qs}`);
 }
 
+export function getPayment(id: string): Promise<Payment> {
+  return http<Payment>(`/payments/${id}`);
+}
+
 export function updatePaymentStatus(id: string, status: PaymentStatus): Promise<Payment> {
   return http<Payment>(`/payments/${id}`, { method:"PATCH", body: JSON.stringify({ status }) });
 }
@@ -105,4 +111,5 @@ export function resendWebhook(id: string): Promise<{status: string}> {
   return http<{status:string}>(`/payments/${id}/resend-webhook`, { method:"POST" });
 }
 
+// Stats
 export function getStats(): Promise<Stats> { return http<Stats>("/stats"); }
